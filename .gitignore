@@ -1,0 +1,48 @@
+# PlatformIO
+.pio/
+.pioenvs/
+.piolibdeps/
+.clang_complete
+.gcc-flags.json
+
+# Build output / release artefacts
+dist/
+build/
+*.bin
+*.elf
+*.map
+*.hex
+
+# Editors
+.vscode/
+.idea/
+*.code-workspace
+*.swp
+*~
+.DS_Store
+
+# Test binaries (sources are tracked, compiled outputs are not)
+test_*
+!test_*.cpp
+!test_*.js
+!tests/
+
+# ── Secrets and per-device state — MUST NEVER BE COMMITTED ──
+# Group keys, duress PINs, AP passwords, and device config are runtime artefacts.
+# Git history is not retractable: if any of these land in a commit, the only fix
+# is to rebuild the repository from a fresh initial commit.
+*.key
+psk.key
+psk_v2.bin
+duress.cfg
+appass.cfg
+batcal.cfg
+gpsbaud.cfg
+wifi_sta.cfg
+tak_server.cfg
+secrets.h
+secrets.ini
+credentials*
+*.pem
+*.p12
+signing_key*
