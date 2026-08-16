@@ -1,0 +1,20 @@
+# Normalise line endings. Shell scripts and the ESP32 sources must be LF: a CRLF
+# shell script fails on the Linux CI runner with an opaque "bad interpreter"
+# error, which is easy to introduce by editing through a GUI on Windows.
+* text=auto eol=lf
+
+*.sh    text eol=lf
+*.yml   text eol=lf
+*.yaml  text eol=lf
+*.cpp   text eol=lf
+*.h     text eol=lf
+*.ini   text eol=lf
+*.csv   text eol=lf
+*.md    text eol=lf
+
+# Binary — never touch
+*.docx  binary
+*.bin   binary
+*.png   binary
+*.jpg   binary
+*.zip   binary
