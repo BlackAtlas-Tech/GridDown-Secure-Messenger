@@ -1,1 +1,354 @@
+# SPDX-FileCopyrightText: 2025-2026 BlackAtlas LLC
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# Builds the firmware from the tagged commit, publishes it as a GitHub Release,
+# and regenerates the flasher manifest consumed by flash.blackatlas.tech.
+#
+# WHY BUILD IN CI RATHER THAN LOCALLY: a locally-built binary cannot be verified
+# by anyone. A CI build from a public tag can — the SHA-256 corresponds to source
+# anybody can read. That correspondence is the point of publishing the source, so
+# the flasher must serve the CI artefact, not a local one.
+#
+# MANIFEST SCHEMA: matches what release.sh produces and what the flasher already
+# consumes:
+#   { device, chip, description, versions: [ {version,label,date,url,offset,
+#     sha256,notes} ] }   newest first
+# It is NOT the ESP Web Tools builds[].parts[] schema.
+#
+# VERSION HISTORY: GitHub Releases are immutable per tag, so the manifest is
+# rebuilt from *all* published releases on every run rather than appended to.
+# That keeps the version list correct with no stored state, and a re-published
+# release self-heals the manifest.
 
+name: Release
+
+on:
+  push:
+    tags: ['v*.*.*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to build (e.g. 6.70.0) — builds only, publishes nothing'
+        required: true
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # ════════════════════════════════════════════════════════════
+  build:
+    name: Build, test and publish release
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+      sha256:  ${{ steps.merge.outputs.sha256 }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Cache PlatformIO
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.platformio
+            .pio
+          key: pio-${{ runner.os }}-${{ hashFiles('platformio.ini') }}
+
+      - name: Install toolchain
+        run: |
+          pip install --upgrade platformio esptool
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libmbedtls-dev jq
+
+      # ── Gate: the version sources must agree ──
+      # Drift between the tag, the firmware constant and the manifest is the
+      # mismatch that quietly destroys trust in source-to-binary correspondence,
+      # so fail the build rather than warn.
+      - name: Verify version parity
+        id: ver
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "push" ]; then
+            TAG_VER="${GITHUB_REF_NAME#v}"
+            case "$TAG_VER" in *-*) PRERELEASE=true ;; *) PRERELEASE=false ;; esac
+          else
+            TAG_VER="${{ github.event.inputs.version }}"
+            PRERELEASE=true
+          fi
+          # Strip any -rc1 suffix before comparing to the firmware constant
+          BASE_VER="${TAG_VER%%-*}"
+          FW_VER=$(grep -oP '#define\s+GRIDDOWN_FW_VERSION\s+"\K[^"]+' src/ui.h)
+          echo "tag=$TAG_VER  base=$BASE_VER  firmware=$FW_VER  prerelease=$PRERELEASE"
+          if [ "$BASE_VER" != "$FW_VER" ]; then
+            echo "::error::Version mismatch — tag '$TAG_VER' (base '$BASE_VER') vs GRIDDOWN_FW_VERSION '$FW_VER' in src/ui.h"
+            exit 1
+          fi
+          if ! echo "$BASE_VER" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::Version '$BASE_VER' is not semver X.Y.Z"
+            exit 1
+          fi
+          echo "version=$TAG_VER"       >> "$GITHUB_OUTPUT"
+          echo "prerelease=$PRERELEASE" >> "$GITHUB_OUTPUT"
+
+      - name: Build firmware
+        run: pio run -e tdeck
+
+      - name: Verify third-party licenses
+        run: |
+          chmod +x tools/verify_licenses.sh
+          tools/verify_licenses.sh --bundle
+
+      - name: Pre-flight checks
+        run: |
+          chmod +x tools/preflight.sh
+          # --quick: the build already ran above, and the git tag/history checks
+          # are not meaningful in a detached CI checkout.
+          tools/preflight.sh --quick
+
+      - name: Run host test harnesses
+        run: |
+          set -euo pipefail
+          fail=0
+          shopt -s nullglob
+          for t in test_*.cpp; do
+            mod="src/$(basename "$t" .cpp | sed 's/^test_//').cpp"
+            b="/tmp/$(basename "$t" .cpp)"
+            if g++ -std=c++17 -include algorithm -w -o "$b" "$t" -lmbedcrypto 2>/dev/null \
+               || g++ -std=c++17 -include algorithm -w -o "$b" "$t" 2>/dev/null \
+               || { [ -f "$mod" ] && g++ -std=c++17 -include algorithm -w -o "$b" "$t" "$mod" -lm 2>/dev/null; }; then
+              echo "--- $t ---"; "$b" || fail=1
+            else
+              echo "::error::$t failed to compile"; fail=1
+            fi
+          done
+          exit $fail
+
+      - name: Merge single-image binary
+        id: merge
+        run: |
+          set -euo pipefail
+          V="${{ steps.ver.outputs.version }}"
+          B=.pio/build/tdeck
+          BOOT_APP0=$(find ~/.platformio -name boot_app0.bin -path '*/partitions/*' | head -1)
+          [ -n "$BOOT_APP0" ] || { echo "::error::boot_app0.bin not found"; exit 1; }
+          mkdir -p dist
+          OUT="dist/griddown-messenger-${V}.bin"
+          esptool.py --chip esp32s3 merge_bin -o "$OUT" \
+            --flash_mode dio --flash_freq 80m --flash_size 16MB \
+            0x0000  "$B/bootloader.bin" \
+            0x8000  "$B/partitions.bin" \
+            0xe000  "$BOOT_APP0" \
+            0x10000 "$B/firmware.bin"
+          ( cd dist && sha256sum "griddown-messenger-${V}.bin" > "griddown-messenger-${V}.bin.sha256" )
+          SHA=$(cut -d' ' -f1 < "dist/griddown-messenger-${V}.bin.sha256")
+          echo "sha256=$SHA" >> "$GITHUB_OUTPUT"
+          echo "Merged image: $(stat -c%s "$OUT") bytes, sha256 $SHA"
+          ls -la dist/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: griddown-firmware-${{ steps.ver.outputs.version }}
+          path: dist/
+          retention-days: 90
+
+      - name: Publish release
+        if: github.event_name == 'push'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          fail_on_unmatched_files: true
+          prerelease: ${{ steps.ver.outputs.prerelease == 'true' }}
+          body: |
+            ## GridDown Secure Messenger v${{ steps.ver.outputs.version }}
+
+            Built by CI from `${{ github.sha }}`. The binary below corresponds to the
+            source at this tag, and the checksum can be verified independently.
+
+            **SHA-256**
+            ```
+            ${{ steps.merge.outputs.sha256 }}
+            ```
+
+            ### Install
+
+            Browser: <https://flash.blackatlas.tech>
+
+            Or with esptool:
+            ```
+            esptool.py --chip esp32s3 write_flash 0x0 griddown-messenger-${{ steps.ver.outputs.version }}.bin
+            ```
+
+            A **full erase** is required when upgrading across a partition-table change.
+
+            ### Before deploying
+
+            Read `SECURITY.md` — it documents what this firmware protects and,
+            importantly, what it does not.
+
+            Licensed GPL-3.0-or-later. See `THIRD_PARTY_NOTICES.md` and
+            `EXPORT_CONTROL.md`.
+
+  # ════════════════════════════════════════════════════════════
+  # Publish firmware + manifest into the WEBSITE repo.
+  #
+  # WHY THIS AND NOT GITHUB PAGES: the flasher at flash.blackatlas.tech is a
+  # separate Cloudflare Pages project that fetches firmware cross-origin from
+  # blackatlas.tech/firmware/messenger/. The site repo's `_headers` already grants
+  # exactly that:
+  #     /firmware/*
+  #         Access-Control-Allow-Origin: https://flash.blackatlas.tech
+  # Serving from anywhere else means re-solving CORS and repointing the flasher.
+  # Publishing into the site repo reuses infrastructure that already works, and
+  # Cloudflare Pages deploys it automatically on push.
+  #
+  # SETUP: create a fine-grained PAT with Contents:write on the website repo and
+  # add it as secret SITE_REPO_TOKEN. Optionally set SITE_REPO (defaults below).
+  # Without the secret this job no-ops, so the workflow is usable immediately.
+  publish-firmware:
+    name: Publish to blackatlas.tech
+    needs: build
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    env:
+      SITE_REPO: ${{ secrets.SITE_REPO || 'BlackAtlas-Tech/blackatlas-site' }}
+      FW_SUBDIR: firmware/messenger
+      # Binaries live in the site's git history, so keep only the most recent
+      # releases there. Older versions remain permanently available as GitHub
+      # Release assets; this bounds site-repo growth.
+      KEEP_VERSIONS: '5'
+    steps:
+      - name: Check whether publishing is configured
+        id: cfg
+        env:
+          TOKEN: ${{ secrets.SITE_REPO_TOKEN }}
+        run: |
+          if [ -n "${TOKEN:-}" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::SITE_REPO_TOKEN not set — skipping site publish. The release and its checksum are on the GitHub Release; upload to blackatlas.tech/firmware/messenger/ manually (see release.sh) or configure SITE_REPO_TOKEN."
+          fi
+
+      - name: Checkout website repo
+        if: steps.cfg.outputs.enabled == 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SITE_REPO }}
+          token: ${{ secrets.SITE_REPO_TOKEN }}
+          path: site
+
+      - name: Download built firmware
+        if: steps.cfg.outputs.enabled == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          name: griddown-firmware-${{ needs.build.outputs.version }}
+          path: dist
+
+      - name: Stage firmware and regenerate manifest
+        if: steps.cfg.outputs.enabled == 'true'
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y -qq jq
+          V="${{ needs.build.outputs.version }}"
+          TARGET="site/${FW_SUBDIR}"
+          mkdir -p "$TARGET"
+
+          cp "dist/griddown-messenger-${V}.bin"        "$TARGET/"
+          cp "dist/griddown-messenger-${V}.bin.sha256" "$TARGET/"
+
+          # Semver-correct ordering, newest first. `sort -V -r` alone is WRONG here:
+          # it ranks 6.70.0-rc1 ABOVE 6.70.0, whereas semver gives a pre-release
+          # LOWER precedence than its own release. Sort on (base version desc,
+          # stable-before-prerelease) so a release candidate never outranks the
+          # release it precedes — otherwise the flasher would offer the rc first.
+          order_versions() {
+            while read -r v; do
+              base="${v%%-*}"
+              case "$v" in *-*) pre=1 ;; *) pre=0 ;; esac
+              printf '%s\t%s\t%s\n' "$base" "$pre" "$v"
+            done | sort -t"$(printf '\t')" -k1,1Vr -k2,2n | cut -f3
+          }
+
+          list_versions() {
+            ls -1 "$TARGET"/griddown-messenger-*.bin 2>/dev/null \
+              | xargs -r -n1 basename \
+              | sed 's/^griddown-messenger-//; s/\.bin$//' \
+              | order_versions
+          }
+
+          # Prune beyond KEEP_VERSIONS. Ordered by version, not mtime — a
+          # re-published release must not evict a newer one.
+          list_versions | tail -n +$((KEEP_VERSIONS + 1)) | while read -r old; do
+            echo "pruning $old"
+            rm -f "$TARGET/griddown-messenger-${old}.bin" "$TARGET/griddown-messenger-${old}.bin.sha256"
+          done
+
+          # Rebuild manifest.json from the files ACTUALLY PRESENT in the directory.
+          # The directory is the source of truth: an entry whose file was pruned
+          # would 404 in the flasher, which is worse than omitting the version.
+          BASE="https://blackatlas.tech/${FW_SUBDIR}"
+          TODAY=$(date -u +%Y-%m-%d)
+          : > /tmp/entries.jsonl
+          list_versions | while read -r ver; do
+              f="$TARGET/griddown-messenger-${ver}.bin"
+              shafile="${f}.sha256"
+              if [ -f "$shafile" ]; then SHA=$(cut -d' ' -f1 < "$shafile"); else SHA=$(sha256sum "$f" | cut -d' ' -f1); fi
+              case "$ver" in *-*) LABEL="$ver (Pre-release)" ;; *) LABEL="$ver (Stable)" ;; esac
+              if [ "$ver" = "$V" ]; then D="$TODAY"; else
+                D=$(jq -r --arg v "$ver" '.versions[]? | select(.version==$v) | .date' "$TARGET/manifest.json" 2>/dev/null | head -1)
+                [ -z "$D" ] || [ "$D" = "null" ] && D="$TODAY"
+              fi
+              jq -n --arg version "$ver" --arg label "$LABEL" --arg date "$D" \
+                    --arg url "${BASE}/griddown-messenger-${ver}.bin" \
+                    --arg sha256 "$SHA" --arg notes "Release v${ver}" \
+                 '{version:$version,label:$label,date:$date,url:$url,offset:0,sha256:$sha256,notes:$notes}' \
+                 >> /tmp/entries.jsonl
+            done
+
+          jq -n --slurpfile v <(jq -s '.' /tmp/entries.jsonl) \
+            --arg src "https://github.com/${GITHUB_REPOSITORY}" \
+            '{ device: "T-Deck CYPHER M8K",
+               chip: "ESP32-S3FN16R8",
+               description: "GridDown Secure Messenger firmware for T-Deck CYPHER M8K",
+               source: $src,
+               generated: (now | todate),
+               versions: $v[0] }' > "$TARGET/manifest.json"
+
+          jq '.' "$TARGET/manifest.json"
+          COUNT=$(jq '.versions | length' "$TARGET/manifest.json")
+          [ "$COUNT" -gt 0 ] || { echo "::error::manifest has no versions"; exit 1; }
+          # Every entry must reference a file that is actually present.
+          jq -r '.versions[].url' "$TARGET/manifest.json" | while read -r u; do
+            f="$TARGET/$(basename "$u")"
+            [ -f "$f" ] || { echo "::error::manifest references missing file: $f"; exit 1; }
+          done
+          echo "manifest: $COUNT version(s), newest $V"
+
+      - name: Commit and push to website repo
+        if: steps.cfg.outputs.enabled == 'true'
+        run: |
+          set -euo pipefail
+          cd site
+          git config user.name  "griddown-release-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add "${FW_SUBDIR}"
+          if git diff --cached --quiet; then
+            echo "No changes to publish."
+          else
+            git commit -m "firmware: GridDown Secure Messenger v${{ needs.build.outputs.version }}
+
+            Built by CI from ${GITHUB_REPOSITORY}@${GITHUB_SHA}
+            SHA-256: ${{ needs.build.outputs.sha256 }}"
+            git push
+            echo "Pushed to ${SITE_REPO}. Cloudflare Pages will deploy automatically."
+            echo "Flasher manifest: https://blackatlas.tech/${FW_SUBDIR}/manifest.json"
+          fi

@@ -1,1 +1,58 @@
-
+# SPDX-FileCopyrightText: 2025-2026 BlackAtlas LLC
+# SPDX-License-Identifier: GPL-3.0-or-later
+name: Bug report
+description: Something behaves incorrectly on-device
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Do not report security vulnerabilities here** — email security@blackatlas.tech.
+        Please do not include real callsigns, coordinates, PSK passphrases, or
+        operational details you would not want public.
+  - type: input
+    id: version
+    attributes:
+      label: Firmware version
+      description: Status screen, or `!info` over serial
+      placeholder: "6.69.0"
+    validations: {required: true}
+  - type: dropdown
+    id: hardware
+    attributes:
+      label: Hardware
+      options: [LILYGO T-Deck CYPHER M8K, LILYGO T-Deck (standard), Other]
+    validations: {required: true}
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened, and what did you expect instead?
+    validations: {required: true}
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1.
+        2.
+        3.
+    validations: {required: true}
+  - type: textarea
+    id: serial
+    attributes:
+      label: Serial log (115200 baud), if available
+      render: text
+  - type: dropdown
+    id: radios
+    attributes:
+      label: How many radios involved?
+      options: ["1", "2", "3 or more"]
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checks
+      options:
+        - label: All radios involved run the same firmware version
+        - label: I performed a full erase if upgrading across a partition-table change
+        - label: I have removed sensitive operational details from this report
+          required: true
