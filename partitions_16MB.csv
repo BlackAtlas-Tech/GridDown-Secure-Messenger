@@ -1,0 +1,23 @@
+# GridDown Secure Messenger — 16MB Partition Table
+# Target: T-Deck CYPHER M8K (ESP32-S3FN16R8, 16MB integrated flash)
+#
+# Layout:
+#   0x0000 - 0x8FFF   Bootloader (not in table, managed by esptool)
+#   0x8000 - 0x8FFF   Partition table (this file)
+#   0x9000 - 0xDFFF   NVS (20KB, 5 pages — WiFi credentials, BLE bonds, system config)
+#   0xE000 - 0xFFFF   OTA data (8KB — boot partition selector, future-proofs OTA)
+#   0x10000 - 0x80FFFF  Application (8MB — 5x current firmware size, massive growth headroom)
+#   0x810000 - 0xFFFFFF LittleFS (7.9MB — messages, configs, baseline, waypoints, future features)
+#
+# Total: 8MB app + 7.9MB storage = 15.9MB used of 16MB flash
+# Previous (default 8MB table): 3.1MB app + 1.5MB storage — severely underutilized 16MB hardware
+#
+# IMPORTANT: Changing partition tables requires a FULL ERASE before flashing.
+#   esptool.py --chip esp32s3 erase_flash
+# Then flash the new firmware. All LittleFS data (messages, PSK, callsign, baseline) will be lost.
+#
+# Name,     Type, SubType, Offset,   Size,     Flags
+nvs,        data, nvs,     0x9000,   0x5000,
+otadata,    data, ota,     0xE000,   0x2000,
+app0,       app,  ota_0,   0x10000,  0x800000,
+spiffs,     data, spiffs,  0x810000, 0x7F0000,
